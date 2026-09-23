@@ -841,7 +841,7 @@ fn emit_class_body(
         // collide with the compiler-generated ones); javac-named ones
         // are skipped at the method loop below.
         head.push_str("enum ");
-        head.push_str(&java_ident(&simple));
+        head.push_str(&sanitize_ref(&simple));
         let _ = ecs;
     } else if is_enum {
         // An enum with constant-specific bodies carries ACC_ABSTRACT —
@@ -853,13 +853,13 @@ fn emit_class_body(
         } else {
             "/* enum */ final class "
         });
-        head.push_str(&java_ident(&simple));
+        head.push_str(&sanitize_ref(&simple));
     } else if is_iface {
         head.push_str("interface ");
-        head.push_str(&java_ident(&simple));
+        head.push_str(&sanitize_ref(&simple));
     } else {
         head.push_str("class ");
-        head.push_str(&java_ident(&simple));
+        head.push_str(&sanitize_ref(&simple));
     }
     // The obscured-super import was emitted at the package line; the
     // clause must render the SIMPLE name (the qualified form binds to
@@ -1145,7 +1145,7 @@ fn emit_class_body(
                         }
                         out.push_str(&format!("    {}", "    ".repeat(depth)));
                         out.push_str(mods);
-                        out.push_str(&java_ident(&simple));
+                        out.push_str(&sanitize_ref(&simple));
                         out.push('(');
                         let mut names = Vec::with_capacity(d.args.len());
                         for (i, a) in d.args.iter().enumerate() {
@@ -2218,42 +2218,73 @@ fn emission_root(pool: &DexPool, internal: &str) -> Option<String> {
 /// declaration sites (java_ident).
 /// Every `.`-segment of a fully-qualified name must start a Java
 /// identifier: obfuscators emit `package do;` and `..badge.new..` paths.
-pub(crate) fn sanitize_fq(dotted: &str) -> String {
+///
+/// PUBLIC on purpose: this is the single source of truth for the
+/// declaration↔file-name mapping. The CLI writer used to keep its own
+/// copy (`sanitize_file_seg`) which had drifted — it lacked the lone-`_`
+/// escape below — so `l.֡` declared `class __` inside a file named
+/// `_.java`. Callers reach it through `sanitize_seg`/`sanitize_internal`.
+///
+/// INJECTIVE on the characters, which is the property the writer needs.
+/// The old mapping folded every non-identifier character to `_`, so
+/// `l.᩻ܶ`, `l.᩻ۡ` and `l.֫᩷` all became `l.__`: on bin.mt.plus 22,636
+/// distinct classes in package `l` collapsed onto three file names, the
+/// writer's EEXIST branch overwrote them, and 22,633 sources were
+/// destroyed with exit code 0. `_u<hex>` keeps them distinct, is
+/// self-describing (it encodes the original code point) and costs the
+/// decompiler nothing — the alternative, minting 22,636 registry
+/// renames, makes every type reference allocate and took this sample
+/// from 5.2 s to 26.8 s.
+///
+/// The only residual collisions are *lookalikes*: a literal class named
+/// `_u1a7b` beside the class `᩻` (same code point), or the pre-existing
+/// keyword form `_do` beside `do`. Those are detected and repaired
+/// deterministically by `lossy_sanitize_renames`, which is why that pass
+/// still exists.
+pub fn sanitize_fq(dotted: &str) -> String {
     dotted
         .split('.')
-        .map(|seg| {
-            if is_java_keyword_name(seg)
-                || is_restricted_type_name(seg)
-                || seg.chars().next().is_some_and(|c| c.is_ascii_digit())
-            {
-                format!("_{seg}")
-            } else if seg
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
-            {
-                seg.to_string()
-            } else {
-                // Non-ASCII single chars (rimet nests classes named `ˆ`
-                // / `ァ`) map to a lone `_` — reserved since Java 9.
-                let mapped: String = seg
-                    .chars()
-                    .map(|c| {
-                        if c.is_ascii_alphanumeric() || c == '_' || c == '$' {
-                            c
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect();
-                if mapped == "_" {
-                    "__".to_string()
-                } else {
-                    mapped
-                }
-            }
-        })
+        .map(sanitize_fq_seg)
         .collect::<Vec<_>>()
         .join(".")
+}
+
+/// One `.`-segment: escape, then repair identifier-position problems.
+fn sanitize_fq_seg(seg: &str) -> String {
+    // Ident-safe ASCII passes through unchanged (the overwhelmingly
+    // common case, and the only one on the borrow-fast path); every
+    // other character — non-ASCII, and ASCII punctuation such as the
+    // `-` in `Collection$-EL` — becomes `_u<hex>`.
+    let plain = seg
+        .chars()
+        .all(|c| c.is_ascii() && (c.is_ascii_alphanumeric() || c == '_' || c == '$'));
+    let mut out = if plain {
+        seg.to_string()
+    } else {
+        use std::fmt::Write as _;
+        let mut s = String::with_capacity(seg.len() + 8);
+        for c in seg.chars() {
+            if c.is_ascii() && (c.is_ascii_alphanumeric() || c == '_' || c == '$') {
+                s.push(c);
+            } else {
+                s.push_str("_u");
+                let _ = write!(s, "{:x}", c as u32);
+            }
+        }
+        s
+    };
+    // `out` is pure ASCII from here: the identifier-position repairs.
+    if is_java_keyword_name(&out)
+        || is_restricted_type_name(&out)
+        || out.chars().next().is_some_and(|c| c.is_ascii_digit())
+    {
+        out.insert(0, '_');
+    }
+    // A lone `_` is a reserved IDENTIFIER since Java 9.
+    if out == "_" {
+        out = "__".to_string();
+    }
+    out
 }
 
 /// Restricted contextual TYPE names — legal as member/local names
@@ -2339,4 +2370,58 @@ pub fn dotted_pool(pool: &DexPool, internal: &str) -> String {
 #[allow(dead_code)]
 fn _unused(_: &dyn Fn(&JavaType) -> jdc_core::types::GenericType) {
     let _ = java_type_to_generic;
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::sanitize_fq;
+
+    /// The property the file writer depends on: distinct class names must
+    /// reach distinct output paths. The lossy predecessor of this mapping
+    /// folded every non-identifier character to `_`, so 22,636 classes of
+    /// `bin.mt.plus` (names built from Thai/Yi/Syriac code points) became
+    /// three (`l.__`, `l.___`, `l._`) and all but three were overwritten.
+    #[test]
+    fn distinct_obfuscated_names_stay_distinct() {
+        // The three names that collapsed onto `l/__.java` in the field.
+        let names = ["l.᩻ܶ", "l.᩻ۡ", "l.֫᩷", "l.֡", "l.᩻᩶ۛ"];
+        let mut mapped: Vec<String> = names.iter().map(|n| sanitize_fq(n)).collect();
+        let before = mapped.len();
+        mapped.sort();
+        mapped.dedup();
+        assert_eq!(mapped.len(), before, "sanitizer folded distinct names: {mapped:?}");
+        assert!(
+            mapped.iter().all(|m| m.is_ascii()),
+            "sanitizer must stay ASCII: {mapped:?}"
+        );
+        // Self-describing: the escape carries the original code point.
+        assert_eq!(sanitize_fq("l.᩻ܶ"), "l._u1a7b_u736");
+    }
+
+    /// Every output must be a legal Java identifier segment: no leading
+    /// digit, no keyword, not the lone `_` reserved since Java 9.
+    #[test]
+    fn output_is_a_legal_identifier() {
+        for (input, want) in [
+            ("do", "_do"),
+            ("_", "__"),
+            ("0Xx", "_0Xx"),
+            ("Collection$-EL", "Collection$_u2dEL"),
+            ("᩻", "_u1a7b"),
+            ("a", "a"),
+            ("A$B", "A$B"),
+            ("x_y", "x_y"),
+        ] {
+            assert_eq!(sanitize_fq(input), want, "input {input:?}");
+        }
+    }
+
+    /// Documented residual: ident-safe ASCII passes through unchanged, so a
+    /// literal `_u1a7b` collides with the single character U+1A7B. The
+    /// collision is real — which is why `lossy_sanitize_renames` still owns
+    /// a repair pass — and this test pins the shape the guard must catch.
+    #[test]
+    fn lookalike_collision_is_known_and_bounded() {
+        assert_eq!(sanitize_fq("_u1a7b"), sanitize_fq("᩻"));
+    }
 }

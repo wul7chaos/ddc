@@ -8,7 +8,7 @@
 pub mod cfg;
 pub mod classdec;
 
-pub use classdec::ClassOptions;
+pub use classdec::{sanitize_fq, ClassOptions};
 pub mod ctx;
 pub mod lift;
 pub mod method;
@@ -1012,6 +1012,24 @@ pub fn top_level_classes(pool: &DexPool) -> Vec<String> {
         .collect()
 }
 
+/// Sanitized form of one internal-name segment — the shared mapping the
+/// declaration site (`print_class_name` → `sanitize_ref`), the CLASS
+/// lookup and the CLI writer must all agree on. Exported so the writer
+/// cannot drift from the declaration (see `sanitize_fq`).
+pub fn sanitize_seg(seg: &str) -> String {
+    classdec::sanitize_fq(seg)
+}
+
+/// Sanitized internal PATH form of a class name: the exact on-disk
+/// identity `source_path` writes and the declaration claims.
+pub fn sanitize_internal(internal: &str) -> String {
+    internal
+        .split('/')
+        .map(classdec::sanitize_fq)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Deterministic case-collision renames over the FILE-emission set:
 /// classes whose internal names differ only in letter case cannot share
 /// one case-insensitive directory; the first (sorted) member of each
@@ -1372,6 +1390,10 @@ pub fn install_case_renames(pool: &DexPool) {
     class_pkg_collision_renames(pool, &mut map);
     obscuring_class_renames(pool, &mut map, &pkg_segs);
     nested_collision_renames(pool, &mut map, &fam_segs);
+    // LAST: lossy-sanitize collisions key on the display form every rule
+    // above has already settled (`l.᩻ܶ` → `l/__.java`, 22,636 classes onto
+    // 3 paths on bin.mt.plus — the silent-overwrite data loss).
+    lossy_sanitize_renames(pool, &mut map);
     jdc_core::rename::set_class_renames(map);
     jdc_core::rename::set_field_renames(member_collision_renames(pool));
 }
@@ -1641,6 +1663,99 @@ fn obscuring_class_renames(
             "[renames] obscuring-class renames: {renamed} (body-gated {body_renamed}; pkgs-with-segs={}, cands={ncands})",
             pkg_segs.len()
         );
+    }
+}
+
+/// Class-level counterpart of the non-ASCII rule already applied to
+/// MEMBERS by `member_collision_renames`, kept as the SAFETY NET behind
+/// the injective `sanitize_fq`.
+///
+/// `sanitize_fq` escapes non-identifier characters as `_u<hex>`, so two
+/// distinct classes normally reach two distinct file names. It cannot be
+/// injective against *lookalikes*, because ident-safe ASCII must pass
+/// through unchanged: a literal class named `_u1a7b` collides with the
+/// class whose single character is U+1A7B, and the pre-existing keyword
+/// repair makes `_do` collide with `do`. Without this pass those pairs
+/// repeat the original disaster — the writer opens with `create_new`,
+/// takes EEXIST, unlinks and rewrites, so one class is destroyed with
+/// exit code 0 (on bin.mt.plus the lossy predecessor of this rule hid
+/// 22,633 of 30,768 classes exactly this way).
+///
+/// Groups are keyed by the SANITIZED path — the exact string both the
+/// declaration site (`sanitize_ref`) and the writer (`source_path`)
+/// produce. The first (sorted) member of each group keeps its name; the
+/// rest become `<sanitized>_2`, `<sanitized>_3`, … Pure ASCII, so a
+/// minted name is a fixed point of the sanitizer: it cannot silently
+/// join a second collision group, and the declaration, every reference
+/// and the file name agree by construction through `apply_class_rename`.
+///
+/// Costs nothing on a healthy pool: one pass over the emission set, and
+/// it returns before touching the registry when every key is unique.
+/// Runs LAST in `install_case_renames`: it keys on the display form the
+/// earlier rules have already settled.
+fn lossy_sanitize_renames(pool: &DexPool, map: &mut HashMap<String, String>) {
+    let names = top_level_classes(pool);
+    // Current display of an emission-set name. `case_rename_map` has
+    // already inserted an entry for every one of these (identity or
+    // renamed) and an exact registry hit short-circuits
+    // `apply_class_rename`, so `map` already holds the final display —
+    // no `$`-prefix walk is needed here.
+    fn key_of(map: &HashMap<String, String>, n: &str) -> String {
+        let disp = map.get(n).map(|s| s.as_str()).unwrap_or(n);
+        sanitize_internal(disp)
+    }
+    let mut counts: HashMap<String, u32> = HashMap::default();
+    for n in &names {
+        *counts.entry(key_of(map, n)).or_insert(0) += 1;
+    }
+    if counts.values().all(|c| *c == 1) {
+        return;
+    }
+    // Every sanitized path in the POOL is off-limits for a minted name,
+    // not just the emission set: an inlined nested class still owns the
+    // display it renders under inside its outer's file.
+    let mut taken: jdc_core::FxHashSet<String> = pool
+        .order
+        .iter()
+        .map(|n| sanitize_internal(map.get(n).map(|s| s.as_str()).unwrap_or(n)))
+        .collect();
+    let mut sorted: Vec<&String> = names.iter().collect();
+    sorted.sort();
+    let mut seen: jdc_core::FxHashSet<String> = jdc_core::FxHashSet::default();
+    let mut renamed = 0usize;
+    for n in sorted {
+        let key = key_of(map, n);
+        if counts.get(&key).copied().unwrap_or(0) < 2 {
+            continue;
+        }
+        if seen.insert(key.clone()) {
+            continue; // first (sorted) member of the group keeps its name
+        }
+        let (pkg, simple) = match key.rsplit_once('/') {
+            Some((p, s)) => (p, s),
+            None => ("", key.as_str()),
+        };
+        let mut i = 1u32;
+        loop {
+            i += 1;
+            let cand = if pkg.is_empty() {
+                format!("{simple}_{i}")
+            } else {
+                format!("{pkg}/{simple}_{i}")
+            };
+            if !taken.insert(cand.clone()) {
+                continue; // already owned by a real class or another mint
+            }
+            // The minted display IS the sanitized name, so
+            // sanitize_internal(cand) == cand and the writer's file name
+            // matches the declaration it writes into it.
+            map.insert(n.clone(), cand);
+            renamed += 1;
+            break;
+        }
+    }
+    if std::env::var("DDC_STATS").is_ok() {
+        eprintln!("[renames] lossy-sanitize collisions renamed={renamed}");
     }
 }
 

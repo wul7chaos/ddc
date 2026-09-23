@@ -1613,6 +1613,19 @@ fn run() -> Result<()> {
 
     let failed = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
+    // Files actually created+written by the writer pool. The summary used
+    // to report `total - failed`, which counts CLASSES ATTEMPTED — on
+    // bin.mt.plus it printed "wrote 22634 file(s)" over 3 physical files,
+    // because the writer's EEXIST path silently overwrote. Count the
+    // syscalls that succeeded instead, so the number is auditable.
+    let written = std::sync::Arc::new(AtomicUsize::new(0));
+    // Writer EEXIST hits (the silent-overwrite branch). Zero on a healthy
+    /// run; reported under DDC_STATS.
+    static OVERWRITES: AtomicUsize = AtomicUsize::new(0);
+    // Writer syscalls that failed outright (ENAMETOOLONG, ENOSPC,
+    // EACCES…). The old writer swallowed these with `let _ =` — a class
+    // whose name overflows NAME_MAX simply never appeared, at exit 0.
+    let write_errors = std::sync::Arc::new(AtomicUsize::new(0));
     // Image retirement (full mode only): workers report each finished
     // class; a dex whose counter hits zero releases its inflated bytes —
     // on lark that is ~360MB reclaimed progressively instead of resident
@@ -1634,6 +1647,59 @@ fn run() -> Result<()> {
     let done_ref = &done;
     let nowrite = std::env::var("DDC_NOWRITE").is_ok();
     let class_time = std::env::var("DDC_CLASSTIME").is_ok();
+
+    // ---- path-collision assertion -------------------------------------
+    // Two distinct classes mapping to one output path is not a cosmetic
+    // problem: the writer opens with `create_new`, takes EEXIST, unlinks
+    // and rewrites, so the last writer wins and every earlier class is
+    // destroyed — with exit code 0 and a summary that still counts them
+    // all. That is exactly how 22,633 of bin.mt.plus's 30,768 classes
+    // vanished (see `lossy_sanitize_renames`). The renamer is supposed
+    // to make the mapping injective; assert it here rather than trusting
+    // it, and fail loudly if any family slips through.
+    if let Sink::Dir(d) = &sink {
+        if !nowrite {
+            let mut first: std::collections::HashMap<PathBuf, &str> =
+                std::collections::HashMap::new();
+            let mut clashes: Vec<(PathBuf, &str, &str)> = Vec::new();
+            for name in &targets {
+                let p = source_path(d, name);
+                match first.entry(p) {
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        clashes.push((e.key().clone(), *e.get(), name.as_str()));
+                    }
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert(name.as_str());
+                    }
+                }
+            }
+            if !clashes.is_empty() {
+                for (p, a, b) in clashes.iter().take(5) {
+                    eprintln!("[!]   {} <- {}, {}", p.display(), a, b);
+                }
+                if std::env::var("DDC_ALLOW_PATH_COLLISION").is_ok() {
+                    eprintln!(
+                        "{}",
+                        bif!(
+                            "[!] {0} class(es) share an output path; the last writer wins and the rest are LOST (DDC_ALLOW_PATH_COLLISION set, continuing)",
+                            "[!] {0} 个类共用同一输出路径；最后一个写入者胜出，其余将丢失（已设 DDC_ALLOW_PATH_COLLISION，继续执行）";
+                            clashes.len()
+                        )
+                    );
+                } else {
+                    bail!(
+                        "{}",
+                        bif!(
+                            "{0} class(es) map to an output path another class already owns (first: {1}) — writing would silently destroy them. This is a sanitizer/rename bug; re-run with DDC_ALLOW_PATH_COLLISION=1 to override.",
+                            "{0} 个类与其它类落盘到同一路径（首个：{1}）——继续写入会静默销毁它们。这是净化/改名规则的 bug；可用 DDC_ALLOW_PATH_COLLISION=1 强制继续。";
+                            clashes.len(),
+                            clashes[0].0.display()
+                        )
+                    );
+                }
+            }
+        }
+    }
 
     // Writer pool: decompile workers hand finished sources to dedicated
     // writer threads through a bounded MPMC queue (std mpsc has no
@@ -1732,6 +1798,8 @@ fn run() -> Result<()> {
         (0..n_writers)
             .map(|_| {
                 let wq = wq.clone();
+                let written = written.clone();
+                let write_errors = write_errors.clone();
                 std::thread::spawn(move || {
                     while let Some(batch) = wq.pop() {
                         for (path, text) in batch {
@@ -1749,6 +1817,12 @@ fn run() -> Result<()> {
                             // cross-writer shard lock is needed — the
                             // final file is always exactly one writer's
                             // complete content under one consistent name.
+                            //
+                            // NB: the EEXIST branch OVERWRITES. It must
+                            // stay unreachable for two distinct classes —
+                            // the driver asserts path injectivity before
+                            // any worker starts, and DDC_STATS surfaces
+                            // the count if that assertion is ever relaxed.
                             use std::io::Write;
                             match std::fs::OpenOptions::new()
                                 .write(true)
@@ -1756,7 +1830,19 @@ fn run() -> Result<()> {
                                 .open(&path)
                             {
                                 Ok(mut f) => {
-                                    let _ = f.write_all(text.as_bytes());
+                                    match f.write_all(text.as_bytes()) {
+                                        Ok(()) => {
+                                            written.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        Err(e) => {
+                                            write_errors.fetch_add(1, Ordering::Relaxed);
+                                            eprintln!(
+                                                "[!] write {}: {}",
+                                                path.display(),
+                                                e
+                                            );
+                                        }
+                                    }
                                 }
                                 Err(e) => {
                                     // NotFound: the dir pre-creator has not
@@ -1767,8 +1853,23 @@ fn run() -> Result<()> {
                                             let _ = std::fs::create_dir_all(parent);
                                         }
                                     }
+                                    if std::env::var("DDC_STATS").is_ok() {
+                                        OVERWRITES.fetch_add(1, Ordering::Relaxed);
+                                    }
                                     let _ = std::fs::remove_file(&path);
-                                    let _ = std::fs::write(&path, text.as_bytes());
+                                    match std::fs::write(&path, text.as_bytes()) {
+                                        Ok(()) => {
+                                            written.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        Err(e) => {
+                                            write_errors.fetch_add(1, Ordering::Relaxed);
+                                            eprintln!(
+                                                "[!] write {}: {}",
+                                                path.display(),
+                                                e
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2083,15 +2184,49 @@ fn run() -> Result<()> {
     } else {
         String::new()
     };
+    // Dir sink reports FILES ON DISK (writer syscalls that succeeded), not
+    // classes attempted: on a lossy path mapping the two differ by the
+    // entire overwritten set (bin.mt.plus: 22634 claimed, 3 written). If
+    // they ever diverge again, say so instead of printing a number that
+    // cannot be checked.
+    let dir_written = if nowrite {
+        total - failed_n
+    } else {
+        written.load(Ordering::Relaxed)
+    };
+    let lost_part = if !nowrite && dir_written != total - failed_n {
+        bif!(
+            ", {0} of {1} classes did not reach disk",
+            "（{0}/{1} 个类未落盘）";
+            (total - failed_n).saturating_sub(dir_written),
+            total - failed_n
+        )
+    } else {
+        String::new()
+    };
+    let werr = write_errors.load(Ordering::Relaxed);
+    if std::env::var("DDC_STATS").is_ok() {
+        let ow = OVERWRITES.load(Ordering::Relaxed);
+        if ow > 0 {
+            eprintln!("[writer] {ow} EEXIST overwrite(s) — output paths were NOT injective");
+        }
+    }
+    let write_err_part = if werr > 0 {
+        bif!(", {0} write error(s)", "（{0} 个写入错误）"; werr)
+    } else {
+        String::new()
+    };
     match &sink {
         Sink::Dir(d) => eprintln!(
             "{}",
             bif!(
-                "ddc: wrote {0} file(s) to {1}{2} in {3}",
-                "ddc：已写出 {0} 个文件到 {1}{2}，用时 {3}";
-                total - failed_n,
+                "ddc: wrote {0} file(s) to {1}{2}{3}{4} in {5}",
+                "ddc：已写出 {0} 个文件到 {1}{2}{3}{4}，用时 {5}";
+                dir_written,
                 d.display(),
                 failed_part,
+                lost_part,
+                write_err_part,
                 elapsed
             )
         ),
@@ -2114,7 +2249,9 @@ fn run() -> Result<()> {
     if std::env::var("DDC_COLLECT").is_ok() {
         unsafe { mimalloc_sys_collect() };
     }
-    if failed_n > 0 {
+    if failed_n > 0 || werr > 0 {
+        // A write error is a lost class: the old code ignored it (exit 0)
+        // and the summary still counted the class as written.
         std::process::exit(1);
     }
     Ok(())
@@ -2195,103 +2332,21 @@ fn resolve_sink(inputs: &[PathBuf], out: Option<&str>, targets: &[String]) -> Re
 }
 
 /// `com/foo/Bar$Inner` → `<out>/com/foo/Bar$Inner.java`.
+///
+/// Both the segment mapping and the declared name come from ddc-dec, so a
+/// file can never disagree with the class inside it. (This used to be a
+/// second, drifted copy of the sanitizer that lacked the lone-`_` escape:
+/// `l.֡` wrote `l/_.java` containing `class __`.)
 fn source_path(out: &Path, internal: &str) -> PathBuf {
-    // Case-collision renames (identity when none installed): the FILE
-    // name must match the DECLARED class name.
+    // Case/package/lossy-sanitize renames (identity when none installed):
+    // the FILE name must match the DECLARED class name.
     let cow = ddc_dec::apply_class_rename(internal);
-    let internal: &str = &cow;
     let mut p = out.to_path_buf();
-    let segs: Vec<&str> = internal.split('/').collect();
-    for seg in segs {
-        // Every path segment must match its DECLARED form: obfuscators
-        // emit `X/0Xx`, keyword class names and even keyword PACKAGES
-        // (`do/b.java` → `_do/b.java`).
-        p.push(sanitize_file_seg(seg));
+    for seg in cow.split('/') {
+        p.push(ddc_dec::sanitize_seg(seg));
     }
     p.set_extension("java");
     p
-}
-
-/// Last-path-segment form of the declaration sanitizer (digit-start and
-/// keyword names gain a leading underscore; `-` maps to `_`).
-fn sanitize_file_seg(seg: &str) -> String {
-    let kw = matches!(
-        seg,
-        "abstract"
-            | "assert"
-            | "boolean"
-            | "break"
-            | "byte"
-            | "case"
-            | "catch"
-            | "char"
-            | "class"
-            | "const"
-            | "continue"
-            | "default"
-            | "do"
-            | "double"
-            | "else"
-            | "enum"
-            | "extends"
-            | "final"
-            | "finally"
-            | "float"
-            | "for"
-            | "goto"
-            | "if"
-            | "implements"
-            | "import"
-            | "instanceof"
-            | "int"
-            | "interface"
-            | "long"
-            | "native"
-            | "new"
-            | "package"
-            | "private"
-            | "protected"
-            | "public"
-            | "return"
-            | "short"
-            | "static"
-            | "strictfp"
-            | "super"
-            | "switch"
-            | "synchronized"
-            | "this"
-            | "throw"
-            | "throws"
-            | "transient"
-            | "try"
-            | "void"
-            | "volatile"
-            | "while"
-            | "true"
-            | "false"
-            | "null"
-        | "_"
-        | "var" | "yield" | "record" | "sealed" | "permits"
-    );
-    let digit_start = seg.chars().next().is_some_and(|c| c.is_ascii_digit());
-    if kw || digit_start {
-        format!("_{seg}")
-    } else if seg
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
-    {
-        seg.to_string()
-    } else {
-        seg.chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '_' || c == '$' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect()
-    }
 }
 
 // ---------------------------------------------------------------------------
